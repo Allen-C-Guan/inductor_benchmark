@@ -25,15 +25,18 @@ def load_snapshot_download():
 
     return snapshot_download
 
+
 EXCLUDE_FILES = [
-    "*.msgpack", 
-    "*.h5", 
-    "tf_model.h5", 
-    "flax_model.msgpack", 
-    "*.gguf",        # 排除量化版（除非你专门测 GGUF）
-    "*.pdf",         # 排除论文等说明文件
-    "onnx/"          # 排除整个 ONNX 文件夹
+    "*.msgpack",
+    "*.h5",
+    "tf_model.h5",
+    "flax_model.msgpack",
+    "*.gguf",  # 排除量化版（除非你专门测 GGUF）
+    "*.pdf",  # 排除论文等说明文件
+    "onnx/",  # 排除整个 ONNX 文件夹
 ]
+
+
 def download_all_models() -> None:
     snapshot_download = load_snapshot_download()
     model_root = project_root() / "model"
@@ -47,7 +50,7 @@ def download_all_models() -> None:
             local_dir=str(target_dir),
             ignore_patterns=EXCLUDE_FILES,
             local_dir_use_symlinks=False,
-            resume_download=True
+            resume_download=True,
         )
 
 

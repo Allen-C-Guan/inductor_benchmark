@@ -8,15 +8,23 @@ This repository currently centers on downloading and storing Hugging Face model 
 
 ## Common commands
 
-- Install the required downloader dependency:
-  - `python -m pip install huggingface_hub`
+- Install runtime and dev dependencies:
+  - `python -m pip install -e ".[dev]"`
 - Download all configured models:
   - `python src/model_download/download_hf_model.py`
+- Run all tests:
+  - `python -m pytest`
+- Run a single test file:
+  - `python -m pytest tests/test_download_hf_model.py`
+- Run lint:
+  - `python -m ruff check .`
+- Format code:
+  - `python -m ruff format .`
 
 ## Test/lint/build status
 
-- There is currently no project-level test suite, linter config, or build system checked into this repository.
-- There is no supported “single test” command yet because no repo test files/config are defined.
+- The repository now uses `pytest` for tests and `ruff` for linting/formatting, configured in `pyproject.toml`.
+- There is still no separate build pipeline beyond editable install via `python -m pip install -e ".[dev]"`.
 
 ## High-level architecture
 
