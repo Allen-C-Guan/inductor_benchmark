@@ -1,0 +1,9 @@
+.venv
+log
+model
+.vscode
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.pyc·
