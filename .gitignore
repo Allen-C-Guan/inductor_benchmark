@@ -6,4 +6,4 @@ model
 *.pth
 *.bin
 *.safetensors
-*.pyc·
+*.pyc

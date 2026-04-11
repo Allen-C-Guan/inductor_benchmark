@@ -9,6 +9,8 @@ description = "Local model download and benchmarking utilities"
 requires-python = ">=3.10"
 dependencies = [
     "huggingface_hub>=0.23",
+    "torch>=2.4",
+    "transformers>=4.45",
 ]
 
 [project.optional-dependencies]
