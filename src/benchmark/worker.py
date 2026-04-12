@@ -255,11 +255,13 @@ def worker_main(task: dict[str, Any], result_queue: Queue) -> None:
     warmup_iters: int = task.get("warmup_iters", 3)
     test_iters: int = task.get("test_iters", 10)
     task_type_hint: str = task.get("task", "auto")
+    mode_label = "compile" if is_compile else "eager"
 
     try:
         # 1-2. Load model
         task_type = infer_task_type(model_dir, task_type_hint)
         model, config = load_model_from_disk(model_dir, task_type, dtype_str)
+        print(f"    [{mode_label}] Model loaded successfully (task_type={task_type})")
 
         # 3. Device transfer
         device = get_device_str(backend)
@@ -273,12 +275,26 @@ def worker_main(task: dict[str, Any], result_queue: Queue) -> None:
         # 4. Generate fresh inputs
         inputs = make_inputs(config, task_type, device, dtype_str)
 
+        # Resolve dtype for autocast
+        dtype_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }
+        dtype = dtype_map.get(dtype_str, torch.float32)
+
         # Optional: compile the model
         if is_compile:
             try:
+                print(f"    [{mode_label}] Compiling model with torch.compile()...")
                 model = torch.compile(model)
+                print(f"    [{mode_label}] Model compiled successfully")
             except Exception:
                 tb_text = traceback.format_exc()
+                print(f"    [{mode_label}] COMPILE_ERROR: {tb_text[-200:]}")
                 result_queue.put(
                     {
                         "status": classify_exception(tb_text, is_compile=True),
@@ -295,12 +311,15 @@ def worker_main(task: dict[str, Any], result_queue: Queue) -> None:
 
         # 5. Warmup
         warmup_iters = max(warmup_iters, 3)
+        print(f"    [{mode_label}] Warming up ({warmup_iters} iterations)...")
         with torch.no_grad(), torch.autocast(device_type=device, dtype=dtype):
             for _ in range(warmup_iters):
                 _ = model(**inputs)
         synchronize_if_torch_device(device)
+        print(f"    [{mode_label}] Warmup completed")
 
         # 6. Timed inference
+        print(f"    [{mode_label}] Running timed inference ({test_iters} iterations)...")
         latencies: list[float] = []
         outputs = []
         with torch.no_grad(), torch.autocast(device_type=device, dtype=dtype):  # TODO
@@ -321,6 +340,10 @@ def worker_main(task: dict[str, Any], result_queue: Queue) -> None:
 
         avg_latency = float(np.mean(latencies))
         p99_latency = float(np.percentile(latencies, 99))
+        print(
+            f"    [{mode_label}] Inference completed: "
+            f"avg={avg_latency:.2f}ms, p99={p99_latency:.2f}ms"
+        )
 
         result_queue.put(
             {
@@ -337,6 +360,7 @@ def worker_main(task: dict[str, Any], result_queue: Queue) -> None:
 
     except RuntimeError:
         tb_text = traceback.format_exc()
+        print(f"    [{mode_label}] RUNTIME_ERROR: {tb_text[-200:]}")
         result_queue.put(
             {
                 "status": classify_exception(tb_text, is_compile),
@@ -351,6 +375,7 @@ def worker_main(task: dict[str, Any], result_queue: Queue) -> None:
         )
     except Exception:
         tb_text = traceback.format_exc()
+        print(f"    [{mode_label}] CRASH: {tb_text[-200:]}")
         result_queue.put(
             {
                 "status": "CRASH",
