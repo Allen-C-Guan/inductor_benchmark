@@ -389,26 +389,28 @@ for _ in range(10):
 ```python
 compiled_model = torch.compile(model, backend=backend_str)
 
-# 编译时间单独记录
-compile_start = time.perf_counter()
-_ = compiled_model(**warmup_inputs)  # 触发编译
-torch.npu.synchronize()
-compile_end = time.perf_counter()
-compile_time_ms = (compile_end - compile_start) * 1000
-
-# Warmup（编译已完成）
-for _ in range(warmup_iters - 1):
-    _ = compiled_model(**warmup_inputs)
-torch.npu.synchronize()
-
-# 正式测量（不含编译时间）
-latencies = []
-for _ in range(test_iters):
+with torch.no_grad():
+    # 编译时间单独记录
     torch.npu.synchronize()
-    start = time.perf_counter()
-    _ = compiled_model(**inputs)
+    compile_start = time.perf_counter()
+    _ = compiled_model(**warmup_inputs)  # 触发编译
     torch.npu.synchronize()
-    latencies.append((time.perf_counter() - start) * 1000)
+    compile_end = time.perf_counter()
+    compile_time_ms = (compile_end - compile_start) * 1000
+
+    # Warmup（编译已完成）
+    for _ in range(warmup_iters - 1):
+        _ = compiled_model(**warmup_inputs)
+    torch.npu.synchronize()
+
+    # 正式测量（不含编译时间）
+    latencies = []
+    for _ in range(test_iters):
+        torch.npu.synchronize()
+        start = time.perf_counter()
+        _ = compiled_model(**inputs)
+        torch.npu.synchronize()
+        latencies.append((time.perf_counter() - start) * 1000)
 ```
 
 ### 7.2 compile_time 的正确记录方式
@@ -418,23 +420,24 @@ for _ in range(test_iters):
 **正确做法**：直接记录首次 forward 的总耗时作为 `compile_time_ms`，不做减法。首次 forward = Dynamo 追踪 + Inductor codegen + kernel launch + 设备执行，这正是用户关心的 "编译一次要等多久"。稳态推理延迟则由后续逐次测量独立提供。
 
 ```python
-# 首次 forward（含编译）
-synchronize_if_torch_device(device)
-t0 = time.perf_counter()
-_ = compiled_model(**inputs)
-synchronize_if_torch_device(device)
-compile_time_ms = (time.perf_counter() - t0) * 1000.0  # 直接使用，不减 avg_latency
-
-# 后续逐次测量（不含编译时间）
-latencies = []
-for _ in range(test_iters):
+with torch.no_grad():
+    # 首次 forward（含编译）
     synchronize_if_torch_device(device)
     t0 = time.perf_counter()
     _ = compiled_model(**inputs)
     synchronize_if_torch_device(device)
-    latencies.append((time.perf_counter() - t0) * 1000)
+    compile_time_ms = (time.perf_counter() - t0) * 1000.0  # 直接使用，不减 avg_latency
 
-avg_latency = sum(latencies) / len(latencies)
+    # 后续逐次测量（不含编译时间）
+    latencies = []
+    for _ in range(test_iters):
+        synchronize_if_torch_device(device)
+        t0 = time.perf_counter()
+        _ = compiled_model(**inputs)
+        synchronize_if_torch_device(device)
+        latencies.append((time.perf_counter() - t0) * 1000)
+
+    avg_latency = sum(latencies) / len(latencies)
 ```
 
 ### 7.3 Dynamo 缓存污染
