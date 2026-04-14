@@ -14,11 +14,6 @@ from typing import Any
 
 import numpy as np
 
-from .model_loader import (
-    load_model,
-    make_inputs,
-)
-
 
 # ---------------------------------------------------------------------------
 # Device helpers
@@ -33,7 +28,11 @@ def synchronize_if_torch_device(device: str) -> None:
 
 def cleanup_device() -> None:
     """Release cached device memory."""
+    import gc
+
     import torch
+
+    gc.collect()
     torch.npu.empty_cache()
 
 
@@ -102,6 +101,8 @@ def worker_main(task: dict[str, Any], result_queue: Queue) -> None:
       7. push result dict to queue and exit
     """
     import torch  # must be first import inside worker
+
+    from .model_loader import load_model, make_inputs
 
     model_dir: str = task["model_dir"]
     is_compile: bool = task["is_compile"]
@@ -183,22 +184,20 @@ def worker_main(task: dict[str, Any], result_queue: Queue) -> None:
 
         print(f"    [{mode_label}] Running timed inference ({test_iters} iterations)...")
         last_output = None
-        
-        # 将同步放在循环外面
-        synchronize_if_torch_device(device)
-        t0_total = time.perf_counter()
-        
+
+        latencies = []
         with torch.no_grad():
             for _ in range(test_iters):
-                last_output = model(**inputs) 
-                
-        synchronize_if_torch_device(device)
-        t1_total = time.perf_counter()
+                synchronize_if_torch_device(device)
+                t0 = time.perf_counter()
+                last_output = model(**inputs)
+                synchronize_if_torch_device(device)
+                latencies.append((time.perf_counter() - t0) * 1000.0)
 
         # 7. 计算与返回
-        # 这种算出来的平均时间才能真正体现 Compile 的并行与融合优势
-        avg_latency = ((t1_total - t0_total) * 1000.0) / test_iters 
-        p99_latency = avg_latency # 吞吐量模式下，用 avg 代替 p99 评估整体性能
+        avg_latency = sum(latencies) / len(latencies)
+        sorted_lat = sorted(latencies)
+        p99_latency = sorted_lat[int(len(sorted_lat) * 0.99)]
         
         serializable_output = serialize_output(last_output)
         compile_time_ms = 0.0
@@ -249,4 +248,12 @@ def worker_main(task: dict[str, Any], result_queue: Queue) -> None:
             }
         )
     finally:
+        try:
+            del model
+        except NameError:
+            pass
+        try:
+            del inputs
+        except NameError:
+            pass
         cleanup_device()
