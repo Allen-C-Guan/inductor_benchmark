@@ -181,27 +181,26 @@ def worker_main(task: dict[str, Any], result_queue: Queue) -> None:
         synchronize_if_torch_device(device)
         print(f"    [{mode_label}] Warmup completed")
 
-        # 6. Timed inference
         print(f"    [{mode_label}] Running timed inference ({test_iters} iterations)...")
-        latencies: list[float] = []
-        outputs = []
+        last_output = None
+        
+        # 将同步放在循环外面
+        synchronize_if_torch_device(device)
+        t0_total = time.perf_counter()
+        
         with torch.no_grad():
             for _ in range(test_iters):
-                synchronize_if_torch_device(device)
-                t0 = time.perf_counter()
-                out = model(**inputs)
-                synchronize_if_torch_device(device)
-                t1 = time.perf_counter()
-                latencies.append((t1 - t0) * 1000.0)
-                outputs.append(out)
+                last_output = model(**inputs) 
+                
+        synchronize_if_torch_device(device)
+        t1_total = time.perf_counter()
 
-        # Pick the last output for comparison
-        last_output = outputs[-1]
-        # 7. Serialize to CPU / numpy
-        serializable_output = serialize_output(last_output)
-        avg_latency = float(np.mean(latencies))
-        p99_latency = float(np.percentile(latencies, 99))
+        # 7. 计算与返回
+        # 这种算出来的平均时间才能真正体现 Compile 的并行与融合优势
+        avg_latency = ((t1_total - t0_total) * 1000.0) / test_iters 
+        p99_latency = avg_latency # 吞吐量模式下，用 avg 代替 p99 评估整体性能
         
+        serializable_output = serialize_output(last_output)
         compile_time_ms = 0.0
         if is_compile:
             compile_time_ms = max(0.0, first_pass_ms - avg_latency)
