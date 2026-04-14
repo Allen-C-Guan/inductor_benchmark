@@ -166,7 +166,7 @@ def run_mode_with_timeout(task: dict[str, Any], timeout_seconds: int) -> dict[st
             "output": None,
         }
 
-    proc.join(timeout=10)
+    proc.join(timeout=30)
     return result
 
 

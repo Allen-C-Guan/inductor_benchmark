@@ -411,7 +411,33 @@ for _ in range(test_iters):
     latencies.append((time.perf_counter() - start) * 1000)
 ```
 
-### 7.2 Dynamo 缓存污染
+### 7.2 compile_time 的正确记录方式
+
+**坑**：不要用 "首次 forward 时间 - 稳态均值" 来估算 compile time。首次 forward 和稳态 forward 的测量方式不同（单次 vs 逐次同步），相减会产生偏差——尤其是稳态均值可能因 kernel 流水线重叠而偏低，导致 compile time 被高估。
+
+**正确做法**：直接记录首次 forward 的总耗时作为 `compile_time_ms`，不做减法。首次 forward = Dynamo 追踪 + Inductor codegen + kernel launch + 设备执行，这正是用户关心的 "编译一次要等多久"。稳态推理延迟则由后续逐次测量独立提供。
+
+```python
+# 首次 forward（含编译）
+synchronize_if_torch_device(device)
+t0 = time.perf_counter()
+_ = compiled_model(**inputs)
+synchronize_if_torch_device(device)
+compile_time_ms = (time.perf_counter() - t0) * 1000.0  # 直接使用，不减 avg_latency
+
+# 后续逐次测量（不含编译时间）
+latencies = []
+for _ in range(test_iters):
+    synchronize_if_torch_device(device)
+    t0 = time.perf_counter()
+    _ = compiled_model(**inputs)
+    synchronize_if_torch_device(device)
+    latencies.append((time.perf_counter() - t0) * 1000)
+
+avg_latency = sum(latencies) / len(latencies)
+```
+
+### 7.3 Dynamo 缓存污染
 
 **坑**：如果在同一进程中先 compile 模型 A，再 compile 模型 B，Dynamo 的字节码分析缓存可能残留模型 A 的信息。
 
@@ -422,7 +448,7 @@ for _ in range(test_iters):
   torch._dynamo.reset()
   ```
 
-### 7.3 Graph Break
+### 7.4 Graph Break
 
 `torch.compile` 在遇到不支持的 Python 特性时会触发 graph break，导致编译后的代码被分段执行，性能可能反而不如 eager。
 
@@ -439,7 +465,7 @@ for _ in range(test_iters):
 torch._dynamo.explain(model)(*inputs)  # 输出 graph break 信息
 ```
 
-### 7.4 Inductor Backend 选择
+### 7.5 Inductor Backend 选择
 
 | Backend / Mode | 适用场景 | 注意事项 |
 |---|---|---|
@@ -452,7 +478,7 @@ torch._dynamo.explain(model)(*inputs)  # 输出 graph break 信息
 | `eager` | 调试/基准对比 | 无编译优化 |
 | `aot_eager` | AOT Autograd 但不做 codegen | 比 `eager` 快，但比 `inductor` 慢 |
 
-### 7.5 Compile 缓存管理
+### 7.6 Compile 缓存管理
 
 如果需要测量 compile 时间（而非仅测量推理延迟），缓存清理策略有重大区别：
 

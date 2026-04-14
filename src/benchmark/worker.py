@@ -198,11 +198,9 @@ def worker_main(task: dict[str, Any], result_queue: Queue) -> None:
         avg_latency = sum(latencies) / len(latencies)
         sorted_lat = sorted(latencies)
         p99_latency = sorted_lat[int(len(sorted_lat) * 0.99)]
-        
+
         serializable_output = serialize_output(last_output)
-        compile_time_ms = 0.0
-        if is_compile:
-            compile_time_ms = max(0.0, first_pass_ms - avg_latency)
+        compile_time_ms = first_pass_ms if is_compile else 0.0
 
         print(
             f"    [{mode_label}] Inference completed: "
