@@ -1,109 +1,223 @@
+## Context
 
-# benchmark
+需要在 `src/benchmark/` 下新增一个尽量简单但正确的 benchmark 脚本，用本地 `model/<alias>/` 平铺模型目录做推理基准，并且严格遵守仓库里的 benchmark 架构约束：主进程只做调度与超时看门狗，真正的模型加载/设备初始化/推理都放到 `spawn` 子进程里完成。用户还要求通过参数选择后端，只支持 `cpu` 和华为 `npu`。
 
-### 标准benchmark流程
+## Recommended approach
 
+### 1. 新增文件
 
+- `src/benchmark/__init__.py`
+- `src/benchmark/run_benchmark.py`
+- `src/benchmark/worker.py`
+- `src/benchmark/compare.py`
+- `tests/test_benchmark_compare.py`
+- `tests/test_benchmark_run.py`
 
-## 2. 系统总体架构 (System Architecture)
+### 2. CLI 设计
 
-系统采用经典的 **Master-Worker（主控-沙箱）无状态架构**。严禁在主进程中引入任何硬件运行时（CUDA/CANN）或深度学习框架的全局状态。
+只做一个简单入口：`python -m src.benchmark.run_benchmark`
 
-架构分为三层：
+建议参数：
 
-1. **调度管控层 (Orchestrator Layer)**：运行在主进程。负责解析测试矩阵、分发任务、设置超时看门狗（Watchdog）、聚合报告。
-2. **无菌沙箱层 (Isolated Sandbox Layer)**：运行在子进程（`spawn` 模式启动）。每个任务（如某模型在 Eager 下的测试）独占一个短暂的子进程，用完即毁。
-3. **校验与度量层 (Metrics & Verifier Layer)**：运行在主进程。负责跨进程数据（NumPy）的重建、严苛的精度比对以及统计学计算。
+- `--model`：必填，`model/<alias>/` 的目录名
+- `--backend`：必填，`cpu` 或 `npu`
+- `--dtype`：可选，默认 `float32`
+- `--warmup-iters`：可选，默认 `3`
+- `--test-iters`：可选，默认 `10`
+- `--timeout-seconds`：可选，默认 `600`
+- `--task`：可选，`auto|causal-lm|seq2seq-lm|masked-lm`，默认 `auto`
 
-------
+### 3. 主进程职责（只做调度）
 
-## 3. 核心模块详细设计 (Detailed Design)
+在 `src/benchmark/run_benchmark.py` 中实现：
 
-### 3.1 进程调度与防灾模块 (Dispatcher & Watchdog)
+- 解析参数
+- 解析仓库根目录与 `model/<alias>/`
+- 构造只包含基础类型的 task payload
+- 使用 `multiprocessing.get_context("spawn")`
+- 严格串行启动两个短生命周期子进程：
+  1. eager 模式
+  2. compile 模式
+- 用 `Queue.get(timeout=...)` 做看门狗
+- 若超时，归类为 `TIMEOUT`
+- 收集两个子进程返回的 CPU/NumPy 结果
+- 调用精度比较逻辑
+- 生成统一宽表结果：`status / eager_latency_ms / compile_latency_ms / speedup / compile_p99_ms / precision_match / error_message`
 
-**设计原则**：假设任何涉及硬件底层调用的代码都会遭遇不可捕获的内核级崩溃（Core Dump）。
+建议主文件中的关键函数：
 
-- **启动隔离**：系统入口强制执行 `multiprocessing.set_start_method('spawn', force=True)`，彻底阻断 C++ 硬件上下文的 Fork 污染。
-- **超时看门狗 (Watchdog)**：主进程在调用 `Queue.get(timeout=T)` 时必须设置时间阈值。如果子进程底层驱动死锁（Deadlock），主进程将记录 `TIMEOUT_CRASH` 并强行回收资源。
-- **串行独占**：为避免 PCIe 总线与显存带宽争抢，测试队列（Eager 测速 -> Compile 测速）必须**严格串行执行**。
+- `parse_args()`
+- `project_root()`（复用现有 `src/model_download/download_hf_model.py` 的模式）
+- `resolve_model_dir(alias)`
+- `build_task_payload(args, is_compile)`
+- `run_mode_with_timeout(task, timeout_seconds)`
+- `assemble_final_result(eager_result, compile_result, compare_result)`
+- `main()`
 
-### 3.2 沙箱工作者模块 (Isolated Worker Lifecycle)
+### 4. Worker 职责（真正执行 benchmark）
 
-这是系统中最脆弱但也最核心的部分。Worker 的生命周期被严格定义为以下 7 个标准动作：
+在 `src/benchmark/worker.py` 中实现：
 
-1. **环境初始化**：进入子进程后，首次 `import torch`，确保 Dynamo 缓存为出厂状态。
-2. **模型装载与净化**：
-   - 从磁盘/HF Hub 加载模型。
-   - 触发 `tie_weights()` 绑定共享内存。
-   - 扫描并强制实例化所有残留的 `Meta` Tensor。
-3. **硬件转移**：调用 `model.to(device).eval()`。
-4. **一次性数据生成**：调用工厂函数生成新鲜的输入数据。**严禁复用数据，严禁从主进程传递张量。**
-5. **要让随机数确定**：确保input必须每次严格一致，因此需要让随机值固定，便于精度测试
-5. **高精度测速闭环**：
-   - **预热 (Warmup)**：至少 3 次前向传播，触发 JIT 编译并稳定硬件频率。
-   - **硬件同步**：在 `perf_counter` 前后，强制调用硬件队列同步 API（如 `torch.npu.synchronize()`）。
-6. **防死锁序列化 (IPC De-coupling)**：
-   - 将模型 Output 移至 CPU。
-   - **强制转换为 NumPy 字节流**，彻底切断与 PyTorch 文件描述符（File Descriptor）及共享内存的绑定，防止跨进程 Queue 瘫痪。
-7. **物理毁灭**：将包含 NumPy 数据的 Dict 推入 Queue，调用 `sys.exit(0)`，将显存回收权交还给 Linux 内核。
-8. 如果需要测试compile时间，需要使用shell脚本指定缓存路径TORCHINDUCTOR_CACHE_DIR， TRITON_CACHE_DIR，ASCEND_CACHE_PATH，并在脚本执行前后移除该文件夹
-### 3.3 精度校验器 (Precision Verifier)
+- `worker_main(task, result_queue)` 作为子进程入口
+- 进入子进程后第一件事 `import torch`
+- 再导入 `transformers`
+- 从本地目录加载模型
+- 如果模型有 `tie_weights()`，就调用
+- `model.to(device).eval()`
+- 在 worker 内生成新输入，绝不从主进程传张量，输出必须确保随机数确定
+- 预热 >= 3 次
+- timing 前后做设备同步
+- eager / compile 各自独立执行
+- 输出搬到 CPU，并转换为可跨进程传输的纯 Python / NumPy 结构
+- 在 `finally` 里做 `empty_cache`
 
-**设计原则**：不信任任何浮点数比对，必须区分硬件越界与舍入误差。
+建议关键函数：
 
-- **递归解析树**：支持对 HuggingFace 复杂的 `ModelOutput`、嵌套 Dict/Tuple/List 进行深度优先遍历。
-- **分类隔离容差**：
-  - Integer / Boolean 标签矩阵：要求绝对相等（`equal`）。
-  - Float32 张量：阈值严格（`rtol=1e-4`, `atol=1e-4`）。
-  - BFloat16 张量：由于尾数截断机制，阈值必须放宽（`rtol=1e-2`, `atol=1e-2`）。
-- **抗 NaN/Inf 干扰**：如果基准输出与编译输出在相同索引处同时出现合法的 NaN/Inf，校验器应视为匹配（`equal_nan=True`）。
-- **深度诊断**：发生错误时，不仅返回 `False`，必须抛出 `Max Absolute Error`、`Max Relative Error` 以及出错张量的路径（如 `past_key_values.layer_3.key`），以供算子开发者定位定界。
+- `worker_main(task, result_queue)`
+- `infer_task_type(model_dir)`
+- `load_model_from_disk(model_dir, task_type, dtype_str)`
+- `make_inputs(config, task_type, device)`
+- `synchronize_if_needed(torch_module, backend)`
+- `serialize_output(value)`
+- `cleanup_device(torch_module, backend)`
+- `classify_exception(traceback_text, is_compile)`
 
-------
+### 5. 模型加载策略（KISS）
 
-## 4. 接口与数据流规约 (Data Flow & Interfaces)
+直接把 `model/<alias>/` 当作 Hugging Face 本地模型目录使用，不做复杂适配。
 
-### 4.1 任务描述输入 (Task Payload)
+推荐流程：
 
-主进程传递给 Worker 的配置必须是纯基础类型（String, Int, Boolean），严禁传递复杂的实例对象。
+- `AutoConfig.from_pretrained(model_dir, local_files_only=True)`
+- `--task auto` 时根据 config 推断任务类型
+- 仅支持三类自动加载：
+  - `AutoModelForCausalLM`
+  - `AutoModelForSeq2SeqLM`
+  - `AutoModelForMaskedLM`
 
-```
-{
-  "task_id": "llama-1b-test",
-  "repo_id": "meta-llama/Llama-3.2-1B",
-  "is_compile": true,
-  "device_str": "npu",
-  "dtype_str": "bfloat16",
-  "warmup_iters": 5,
-  "test_iters": 50
-}
-```
+这样可以覆盖当前仓库里最可能的模型：
 
-### 4.2 标准化报告输出 (Result Schema)
+- Qwen -> causal lm
+- T5 -> seq2seq lm
+- BERT -> masked lm
 
-压测结束后，系统输出具有高度确定性的宽表数据，可直接对接到前端大盘或 CI/CD (Jenkins/GitLab) 流水线。
+限制明确保留：
 
-```
-{
-  "model_id": "Llama-3.2-1B",
-  "dtype": "bfloat16",
-  "status": "SUCCESS",            // 可选值: SUCCESS, OOM, TIMEOUT, PRECISION_FAIL, CRASH
-  "eager_latency_ms": 25.40,
-  "compile_latency_ms": 12.10,
-  "speedup": 2.10,                // 严格遵守: eager_latency / compile_latency
-  "compile_p99_ms": 12.50,        // 反映长尾延迟抖动
-  "precision_match": true,
-  "error_message": ""             // 如果失败，保留最后 1000 字符的 Traceback
-}
-```
+- 不尝试支持所有 Hugging Face 架构
+- 初版不启用 `trust_remote_code=True`
+- 如果本地目录缺关键文件，直接明确失败并返回错误信息
 
-------
+### 6. 输入生成策略（保持简单）
 
-## 5. 异常处理与容灾机制 (Error Handling)
+为了避免 tokenizer/processor 复杂度，使用 worker 内合成输入：
 
-1. **OOM (Out of Memory) 翻译**： 子进程捕获到异常时，需分析 `Traceback` 的字符串。如果是分配显存失败（`CUDA out of memory` / `CANN memory allocation failed`），需将系统状态强制置为 `OOM`，而不是模糊的 `FAIL`。
-2. **算子库降级与 Panic 追踪**： 当底层 Triton 内核生成失败或 NPU 算子图融合失败时，记录特殊的 `COMPILE_ERROR`，此类错误通常表明编译器规则不支持当前模型架构，需提报给编译器研发团队。
-3. **残留资源清理**： 即使 Python 发生了异常，`finally` 块中必须包含跨设备的空闲显存释放指令（`empty_cache`），尽人事听天命，最终由操作系统兜底。
+- 文本模型统一生成固定 shape 的 `input_ids` 和 `attention_mask`
+- causal/masked/seq2seq 分别按最小必需字段构造
+- 不从主进程传 tensor
+- 不做真实文本预处理
 
+这更符合用户要求的 KISS，也符合 benchmark notes 的“一次性数据生成”。
 
+### 7. compile 路径策略
 
+保持最简单实现：
+
+- eager：直接 `model(**inputs)`
+- compile：若 `torch.compile` 可用，则 `compiled_model = torch.compile(model)` 后执行
+- 如果当前环境（尤其是 NPU）不支持 compile，则在 worker 中标记 `COMPILE_ERROR`
+
+不额外加入 backend-specific compile 选项或复杂优化开关。
+
+### 8. 精度比较
+
+在 `src/benchmark/compare.py` 中实现纯函数比较器：
+
+- 递归支持 dict / list / tuple / Hugging Face 风格输出结构
+- int/bool 必须完全相等
+- float32: `rtol=1e-4, atol=1e-4`
+- bfloat16: `rtol=1e-2, atol=1e-2`
+- `equal_nan=True`
+- 失败时报告：
+  - failing path
+  - max absolute error
+  - max relative error
+
+建议函数：
+
+- `compare_outputs(expected, actual, dtype_str)`
+- `compare_node(path, left, right, summary)`
+- `tensor_tolerances(dtype_name)`
+
+### 9. 状态与错误归类
+
+遵循 notes：
+
+- worker 内部可返回：`SUCCESS`, `OOM`, `CRASH`, `COMPILE_ERROR`
+- 主进程超时映射为：`TIMEOUT`
+- eager/compile 都成功但精度失败时，最终状态为：`PRECISION_FAIL`
+- `OOM` 通过 traceback 文本匹配：
+  - `CUDA out of memory`
+  - `CANN memory allocation failed`
+
+最终输出 schema 统一为宽表，包含：
+
+- `model_id`
+- `dtype`
+- `status`
+- `eager_latency_ms`
+- `compile_latency_ms`
+- `speedup`
+- `compile_p99_ms`
+- `precision_match`
+- `error_message`
+
+### 10. 测试策略
+
+不做真实硬件端到端测试，避免脆弱。
+
+新增：
+
+- `tests/test_benchmark_compare.py`
+  - 覆盖 int/bool 精确比较
+  - float32 / bfloat16 容差
+  - 嵌套结构遍历
+  - NaN/Inf 对齐情况
+  - 错误路径与误差统计
+- `tests/test_benchmark_run.py`
+  - payload 只含基础类型
+  - `Queue.get(timeout=...)` 超时映射 `TIMEOUT`
+  - eager/compile 成功 + compare 成功 -> `SUCCESS`
+  - eager/compile 成功 + compare 失败 -> `PRECISION_FAIL`
+  - 错误文本映射 `OOM` / `COMPILE_ERROR`
+
+## Critical files to modify
+
+- `src/benchmark/__init__.py`
+- `src/benchmark/run_benchmark.py`
+- `src/benchmark/worker.py`
+- `src/benchmark/compare.py`
+- `tests/test_benchmark_compare.py`
+- `tests/test_benchmark_run.py`
+
+## Existing code/patterns to reuse
+
+- `src/model_download/download_hf_model.py`
+  - 复用其 `project_root()` 风格来定位仓库根目录和 `model/`
+- `benchmark notes.md`
+  - 作为 benchmark 架构与状态机的硬约束
+- `tests/test_download_hf_model.py`
+  - 复用其 pytest + monkeypatch 风格做 orchestration 级测试
+
+## Verification
+
+1. 运行单元测试：`python -m pytest tests/test_benchmark_compare.py tests/test_benchmark_run.py`
+2. 运行全量测试：`python -m pytest`
+3. 运行 lint：`python -m ruff check .`
+4. 手工执行脚本验证参数与结果 schema：
+   - `python -m src.benchmark.run_benchmark --model t5_small --backend cpu`
+   - `python -m src.benchmark.run_benchmark --model qwen3_0_6b --backend npu`
+5. 重点检查：
+   - 主进程不导入 `torch`
+   - 子进程使用 `spawn`
+   - 超时能正确返回 `TIMEOUT`
+   - 输出字段完整且 `speedup = eager / compile`
