@@ -38,6 +38,7 @@
    - 扫描并强制实例化所有残留的 `Meta` Tensor。
 3. **硬件转移**：调用 `model.to(device).eval()`。
 4. **一次性数据生成**：调用工厂函数生成新鲜的输入数据。**严禁复用数据，严禁从主进程传递张量。**
+5. **要让随机数确定**：确保input必须每次严格一致，因此需要让随机值固定，便于精度测试
 5. **高精度测速闭环**：
    - **预热 (Warmup)**：至少 3 次前向传播，触发 JIT 编译并稳定硬件频率。
    - **硬件同步**：在 `perf_counter` 前后，强制调用硬件队列同步 API（如 `torch.npu.synchronize()`）。
@@ -45,7 +46,7 @@
    - 将模型 Output 移至 CPU。
    - **强制转换为 NumPy 字节流**，彻底切断与 PyTorch 文件描述符（File Descriptor）及共享内存的绑定，防止跨进程 Queue 瘫痪。
 7. **物理毁灭**：将包含 NumPy 数据的 Dict 推入 Queue，调用 `sys.exit(0)`，将显存回收权交还给 Linux 内核。
-
+8. 如果需要测试compile时间，需要使用shell脚本指定缓存路径TORCHINDUCTOR_CACHE_DIR， TRITON_CACHE_DIR，ASCEND_CACHE_PATH，并在脚本执行前后移除该文件夹
 ### 3.3 精度校验器 (Precision Verifier)
 
 **设计原则**：不信任任何浮点数比对，必须区分硬件越界与舍入误差。
