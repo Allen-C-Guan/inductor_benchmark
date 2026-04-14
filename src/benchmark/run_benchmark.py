@@ -46,14 +46,14 @@ def resolve_output_dir() -> Path:
     return project_root() / "output"
 
 
-def save_results(results: list[dict[str, Any]], output_dir: Path) -> Path:
+def save_results(results: list[dict[str, Any]], output_dir: Path, dtype: str = "float32", inductor_backend: str = "triton") -> Path:
     """Save benchmark results to CSV file in output directory.
 
     Returns the path to the saved file.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = output_dir / f"benchmark_{timestamp}.csv"
+    csv_path = output_dir / f"benchmark_{dtype}_{inductor_backend}_{timestamp}.csv"
 
     if not results:
         # Write empty file with headers
@@ -64,11 +64,18 @@ def save_results(results: list[dict[str, Any]], output_dir: Path) -> Path:
                     "model_id",
                     "dtype",
                     "status",
+                    "eager_status",
                     "eager_latency_ms",
+                    "eager_p99_ms",
+                    "eager_error_message",
+                    "compile_status",
                     "compile_latency_ms",
-                    "speedup",
                     "compile_p99_ms",
+                    "compile_time_ms",
+                    "compile_error_message",
+                    "speedup",
                     "precision_match",
+                    "precision_error",
                     "error_message",
                 ]
             )
@@ -91,7 +98,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--model", help="Model alias (directory name under model/). Runs all if not specified."
     )
     parser.add_argument("--all", action="store_true", help="Benchmark all models under model/")
-    parser.add_argument("--backend", required=True, choices=["cpu", "npu"], help="Device backend")
     parser.add_argument("--dtype", default="float32", help="Data type (default: float32)")
     parser.add_argument(
         "--warmup-iters", type=int, default=3, help="Warmup iterations (default: 3)"
@@ -105,8 +111,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--task",
         default="auto",
-        choices=["auto", "causal-lm", "seq2seq-lm", "masked-lm"],
+        choices=["auto", "base", "causal-lm", "seq2seq-lm", "masked-lm", "sequence-classification", "speech-seq2seq", "vision2seq"],
         help="Task type hint (default: auto)",
+    )
+    parser.add_argument(
+        "--inductor-backend",
+        default="triton",
+        choices=["triton", "dvm", "mlir"],
+        help="Inductor backend type for torch.compile (default: triton)",
     )
     return parser.parse_args(argv)
 
@@ -118,11 +130,11 @@ def build_task_payload(
     return {
         "model_dir": str(resolve_model_dir(model_alias)),
         "is_compile": is_compile,
-        "backend": args.backend,
         "dtype": args.dtype,
         "warmup_iters": args.warmup_iters,
         "test_iters": args.test_iters,
         "task": args.task,
+        "inductor_backend": args.inductor_backend,
     }
 
 
@@ -145,14 +157,11 @@ def run_mode_with_timeout(task: dict[str, Any], timeout_seconds: int) -> dict[st
         proc.join(timeout=300)  # 如果十秒了，子进程还没有自行了断完成
         if proc.is_alive():
             proc.kill()  # 那就直接杀掉子进程
-            proc.join(timeout=180)
+            proc.join(timeout=300)
         return {
             "status": "TIMEOUT",
-            "eager_latency_ms": 0.0,
-            "compile_latency_ms": 0.0,
-            "speedup": 0.0,
-            "compile_p99_ms": 0.0,
-            "precision_match": False,
+            "latency_ms": 0.0,
+            "p99_latency_ms": 0.0,
             "error_message": f"Worker timed out after {timeout_seconds}s",
             "output": None,
         }
@@ -168,60 +177,70 @@ def assemble_final_result(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     """Combine eager + compile results into the canonical wide-table schema."""
+    # Extract eager metrics
+    eager_status = eager_result.get("status", "UNKNOWN")
+    eager_latency = eager_result.get("latency_ms", 0.0)
+    eager_p99 = eager_result.get("p99_latency_ms", 0.0)
+    eager_error = eager_result.get("error_message", "")
+
+    # Extract compile metrics
+    compile_status = compile_result.get("status", "UNKNOWN")
+    compile_latency = compile_result.get("latency_ms", 0.0)
+    compile_p99 = compile_result.get("p99_latency_ms", 0.0)
+    compile_time = compile_result.get("compile_time_ms", 0.0)
+    compile_error = compile_result.get("error_message", "")
+
+    # Calculate speedup
+    speedup = eager_latency / compile_latency if compile_latency > 0 else 0.0
+
+    # Determine precision match
+    precision_match = True
+    precision_error = ""
+
     # Determine overall status
-    for key in ("eager_result", "compile_result"):
-        res = eager_result if key == "eager_result" else compile_result
-        if res["status"] not in ("SUCCESS",):
-            # Propagate the first non-success status
-            mode_label = "eager" if key == "eager_result" else "compile"
-            error_msg = res.get("error_message", "")
-            return {
-                "model_id": model_alias,
-                "dtype": args.dtype,
-                "status": res["status"],
-                "eager_latency_ms": eager_result.get("eager_latency_ms", 0.0),
-                "compile_latency_ms": compile_result.get("compile_latency_ms", 0.0),
-                "speedup": 0.0,
-                "compile_p99_ms": compile_result.get("compile_p99_ms", 0.0),
-                "precision_match": False,
-                "error_message": f"[{mode_label}] {error_msg}",
-            }
+    if eager_status == "SUCCESS" and compile_status == "SUCCESS":
+        eager_output = eager_result.get("output")
+        compile_output = compile_result.get("output")
 
-    # Both SUCCESS — run precision comparison
-    eager_output = eager_result.get("output")
-    compile_output = compile_result.get("output")
+        if eager_output is None or compile_output is None:
+            precision_match = False
+            precision_error = "One or both outputs are None, cannot compare precision"
+        else:
+            compare = compare_outputs(eager_output, compile_output, args.dtype)
+            precision_match = compare.precision_match
+            precision_error = compare.error_message if not compare.precision_match else ""
 
-    if eager_output is None or compile_output is None:
-        return {
-            "model_id": model_alias,
-            "dtype": args.dtype,
-            "status": "PRECISION_FAIL",
-            "eager_latency_ms": eager_result.get("eager_latency_ms", 0.0),
-            "compile_latency_ms": compile_result.get("compile_latency_ms", 0.0),
-            "speedup": 0.0,
-            "compile_p99_ms": compile_result.get("compile_p99_ms", 0.0),
-            "precision_match": False,
-            "error_message": "One or both outputs are None, cannot compare precision",
-        }
-
-    compare = compare_outputs(eager_output, compile_output, args.dtype)
-
-    eager_lat = eager_result["eager_latency_ms"]
-    compile_lat = compile_result["compile_latency_ms"]
-    speedup = eager_lat / compile_lat if compile_lat > 0 else 0.0
-
-    status = "SUCCESS" if compare.precision_match else "PRECISION_FAIL"
+    # Determine overall status and error_message
+    if eager_status != "SUCCESS" or compile_status != "SUCCESS":
+        status = "CRASH" if eager_status == "CRASH" or compile_status == "CRASH" else eager_status
+        error_message = eager_error if eager_error else compile_error
+    elif not precision_match:
+        status = "PRECISION_FAIL"
+        error_message = precision_error
+    else:
+        status = "SUCCESS"
+        error_message = ""
 
     return {
         "model_id": model_alias,
         "dtype": args.dtype,
         "status": status,
-        "eager_latency_ms": round(eager_lat, 4),
-        "compile_latency_ms": round(compile_lat, 4),
+        # Eager mode info
+        "eager_status": eager_status,
+        "eager_latency_ms": round(eager_latency, 4),
+        "eager_p99_ms": round(eager_p99, 4),
+        "eager_error_message": eager_error,
+        # Compile mode info
+        "compile_status": compile_status,
+        "compile_latency_ms": round(compile_latency, 4),
+        "compile_p99_ms": round(compile_p99, 4),
+        "compile_time_ms": round(compile_time, 4),
+        "compile_error_message": compile_error,
+        # Comparison info
         "speedup": round(speedup, 4),
-        "compile_p99_ms": round(compile_result.get("compile_p99_ms", 0.0), 4),
-        "precision_match": compare.precision_match,
-        "error_message": compare.error_message if not compare.precision_match else "",
+        "precision_match": precision_match,
+        "precision_error": precision_error,
+        "error_message": error_message,
     }
 
 
@@ -229,19 +248,27 @@ def run_single_model(model_alias: str, args: argparse.Namespace) -> dict[str, An
     """Run benchmark for a single model and return the result."""
     model_path = resolve_model_dir(model_alias)
     if not model_path.exists():
+        error_msg = f"Model directory {model_path} does not exist"
         return {
             "model_id": model_alias,
             "dtype": args.dtype,
             "status": "CRASH",
+            "eager_status": "CRASH",
             "eager_latency_ms": 0.0,
+            "eager_p99_ms": 0.0,
+            "eager_error_message": error_msg,
+            "compile_status": "CRASH",
             "compile_latency_ms": 0.0,
-            "speedup": 0.0,
             "compile_p99_ms": 0.0,
+            "compile_time_ms": 0.0,
+            "compile_error_message": error_msg,
+            "speedup": 0.0,
             "precision_match": False,
-            "error_message": f"Model directory {model_path} does not exist",
+            "precision_error": "",
+            "error_message": error_msg,
         }
 
-    print(f"Benchmarking model={model_alias} backend={args.backend} dtype={args.dtype}")
+    print(f"Benchmarking model={model_alias} dtype={args.dtype}")
 
     # 1. Eager mode
     print("  Running eager mode...")
@@ -283,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Save results to output directory
     output_dir = resolve_output_dir()
-    csv_path = save_results(results, output_dir)
+    csv_path = save_results(results, output_dir, args.dtype, args.inductor_backend)
     print(f"\n=== Results saved to {csv_path} ===")
 
     # Return non-zero if any model failed
